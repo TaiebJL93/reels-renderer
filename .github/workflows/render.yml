@@ -39,24 +39,33 @@ jobs:
     steps:
       - name: Check secrets
         env:
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
           CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
           CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
           CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
         run: |
-          for s in PEXELS_API_KEY CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET; do
+          if ! [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "Invalid job_id" | tee error.txt; exit 1; fi
+          SOURCE="$(printf '%s' "$REQUEST" | jq -r '.video_source // "pixabay"' 2>/dev/null || echo pixabay)"
+          case "$SOURCE" in
+            pixabay) NEEDED="PIXABAY_API_KEY" ;;
+            pexels) NEEDED="PEXELS_API_KEY" ;;
+            *) echo "Unsupported video_source: $SOURCE (use pixabay or pexels)" | tee error.txt; exit 1 ;;
+          esac
+          for s in "$NEEDED" CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET; do
             if [ -z "${!s}" ]; then echo "Missing repository secret $s" | tee error.txt; exit 1; fi
           done
-          if ! [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "Invalid job_id" | tee error.txt; exit 1; fi
 
       - name: Start MoneyPrinterTurbo
         env:
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: |
           mkdir -p mpt/storage
           docker pull -q "$IMAGE"
           docker run --rm --entrypoint cat "$IMAGE" /MoneyPrinterTurbo/config.example.toml > mpt/config.toml
           sed -i -E \
+            -e "s|^pixabay_api_keys = .*|pixabay_api_keys = [\"$PIXABAY_API_KEY\"]|" \
             -e "s|^pexels_api_keys = .*|pexels_api_keys = [\"$PEXELS_API_KEY\"]|" \
             -e "s|^max_concurrent_tasks = .*|max_concurrent_tasks = 1|" \
             -e "s|^subtitle_provider = .*|subtitle_provider = \"edge\"|" \
