@@ -84,8 +84,11 @@ jobs:
 
       - name: Render video
         run: |
-          printf '%s' "$REQUEST" > request.json
-          jq -e . request.json >/dev/null || { echo "Request is not valid JSON" | tee error.txt; exit 1; }
+          printf '%s' "$REQUEST" > request.raw.json
+          jq -e . request.raw.json >/dev/null || { echo "Request is not valid JSON" | tee error.txt; exit 1; }
+          # overlay_hook is for the headline step below, MoneyPrinterTurbo never sees it
+          jq -r '.overlay_hook // ""' request.raw.json > hook.txt
+          jq 'del(.overlay_hook)' request.raw.json > request.json
           RESPONSE="$(curl -sS -X POST http://127.0.0.1:8080/api/v1/videos -H 'Content-Type: application/json' --data @request.json)"
           TASK_ID="$(echo "$RESPONSE" | jq -r '.data.task_id // empty')"
           if [ -z "$TASK_ID" ]; then
@@ -114,6 +117,34 @@ jobs:
           done
           echo "Video not finished after 25 minutes" | tee error.txt
           exit 1
+
+      - name: Add hook headline, 30 fps, check size
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg fonts-dejavu-core >/dev/null
+          FONT=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf
+          # Hook as a boxed headline at the top centre for the first 3 s (sound-off viewers), max 3 lines
+          FILTER="scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1,fps=30"
+          HOOK="$(tr -s '[:space:]' ' ' < hook.txt | sed 's/^ //; s/ $//')"
+          if [ -n "$HOOK" ]; then
+            printf '%s\n' "$HOOK" | fold -s -w 20 | sed 's/ *$//' | head -3 > lines.txt
+            i=0
+            while IFS= read -r LINE; do
+              printf '%s' "$LINE" > "line$i.txt"
+              FILTER="$FILTER,drawtext=fontfile=$FONT:textfile=line$i.txt:expansion=none:fontsize=78:fontcolor=white:box=1:boxcolor=black@0.65:boxborderw=22:x=(w-text_w)/2:y=300+$i*120:enable='lt(t,3)'"
+              i=$((i+1))
+            done < lines.txt
+          fi
+          ffmpeg -hide_banner -loglevel error -y -i reel.mp4 -vf "$FILTER" \
+            -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -r 30 \
+            -c:a aac -b:a 192k -ar 44100 -movflags +faststart reel-final.mp4 \
+            || { echo "Could not add the hook headline (ffmpeg failed)" | tee error.txt; exit 1; }
+          SIZE="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 reel-final.mp4)"
+          echo "Final video: $SIZE"
+          case "$SIZE" in
+            1080,1920,30/1) mv reel-final.mp4 reel.mp4 ;;
+            *) echo "Final video is $SIZE, expected 1080x1920 at 30 fps" | tee error.txt; exit 1 ;;
+          esac
 
       - name: Upload to Cloudinary
         env:
