@@ -1,0 +1,141 @@
+# Renders one Instagram Reel with MoneyPrinterTurbo on a free GitHub Actions runner,
+# uploads the MP4 to Cloudinary and reports back to n8n.
+# Started by the n8n workflow "Reels – Generate Videos (MoneyPrinterTurbo)".
+name: Render reel
+run-name: Render ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Reel id plus n8n execution id
+        required: true
+        type: string
+      request:
+        description: MoneyPrinterTurbo /api/v1/videos request body (JSON)
+        required: true
+        type: string
+      callback_url:
+        description: n8n resume URL that receives the result
+        required: true
+        type: string
+
+concurrency:
+  group: render-reel
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      IMAGE: ghcr.io/harry0703/moneyprinterturbo:latest
+      JOB_ID: ${{ inputs.job_id }}
+      REQUEST: ${{ inputs.request }}
+      CALLBACK_URL: ${{ inputs.callback_url }}
+    steps:
+      - name: Check secrets
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: |
+          for s in PEXELS_API_KEY CLOUDINARY_CLOUD_NAME CLOUDINARY_API_KEY CLOUDINARY_API_SECRET; do
+            if [ -z "${!s}" ]; then echo "Missing repository secret $s" | tee error.txt; exit 1; fi
+          done
+          if ! [[ "$JOB_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then echo "Invalid job_id" | tee error.txt; exit 1; fi
+
+      - name: Start MoneyPrinterTurbo
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          mkdir -p mpt/storage
+          docker pull -q "$IMAGE"
+          docker run --rm --entrypoint cat "$IMAGE" /MoneyPrinterTurbo/config.example.toml > mpt/config.toml
+          sed -i -E \
+            -e "s|^pexels_api_keys = .*|pexels_api_keys = [\"$PEXELS_API_KEY\"]|" \
+            -e "s|^max_concurrent_tasks = .*|max_concurrent_tasks = 1|" \
+            -e "s|^subtitle_provider = .*|subtitle_provider = \"edge\"|" \
+            mpt/config.toml
+          docker run -d --name mpt -p 127.0.0.1:8080:8080 \
+            -v "$PWD/mpt/config.toml:/MoneyPrinterTurbo/config.toml" \
+            -v "$PWD/mpt/storage:/MoneyPrinterTurbo/storage" \
+            "$IMAGE" python3 main.py
+          for _ in $(seq 1 90); do
+            curl -fs http://127.0.0.1:8080/api/v1/tasks >/dev/null && exit 0
+            sleep 2
+          done
+          echo "MoneyPrinterTurbo did not start" | tee error.txt
+          docker logs --tail 50 mpt
+          exit 1
+
+      - name: Render video
+        run: |
+          printf '%s' "$REQUEST" > request.json
+          jq -e . request.json >/dev/null || { echo "Request is not valid JSON" | tee error.txt; exit 1; }
+          RESPONSE="$(curl -sS -X POST http://127.0.0.1:8080/api/v1/videos -H 'Content-Type: application/json' --data @request.json)"
+          TASK_ID="$(echo "$RESPONSE" | jq -r '.data.task_id // empty')"
+          if [ -z "$TASK_ID" ]; then
+            echo "MoneyPrinterTurbo rejected the request: $(echo "$RESPONSE" | jq -c '.message // .detail // .' | cut -c1-300)" | tee error.txt
+            exit 1
+          fi
+          echo "Task $TASK_ID started"
+          for i in $(seq 1 150); do
+            sleep 10
+            TASK="$(curl -fsS "http://127.0.0.1:8080/api/v1/tasks/$TASK_ID" || echo '{}')"
+            STATE="$(echo "$TASK" | jq -r '.data.state // empty')"
+            echo "check $i: state=$STATE progress=$(echo "$TASK" | jq -r '.data.progress // 0')%"
+            if [ "$STATE" = "1" ]; then
+              VIDEO="$(find "mpt/storage/tasks/$TASK_ID" -name 'final-*.mp4' 2>/dev/null | head -1)"
+              [ -n "$VIDEO" ] || { echo "Finished, but no MP4 was written" | tee error.txt; exit 1; }
+              cp "$VIDEO" reel.mp4
+              ls -lh reel.mp4
+              exit 0
+            fi
+            if [ "$STATE" = "-1" ]; then
+              docker logs --tail 80 mpt
+              REASON="$(docker logs mpt 2>&1 | grep -iE 'error|exception|failed' | tail -1 | cut -c1-250)"
+              echo "MoneyPrinterTurbo could not make the video: ${REASON:-see the Actions log}" | tee error.txt
+              exit 1
+            fi
+          done
+          echo "Video not finished after 25 minutes" | tee error.txt
+          exit 1
+
+      - name: Upload to Cloudinary
+        env:
+          CLOUD: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+        run: |
+          TS="$(date +%s)"
+          PID="reels/$JOB_ID"
+          SIG="$(printf 'overwrite=true&public_id=%s&timestamp=%s%s' "$PID" "$TS" "$SECRET" | sha1sum | cut -d' ' -f1)"
+          RESPONSE="$(curl -sS -X POST "https://api.cloudinary.com/v1_1/$CLOUD/video/upload" \
+            -F file=@reel.mp4 -F public_id="$PID" -F overwrite=true \
+            -F timestamp="$TS" -F api_key="$KEY" -F signature="$SIG")"
+          URL="$(echo "$RESPONSE" | jq -r '.secure_url // empty')"
+          if [ -z "$URL" ]; then
+            echo "Cloudinary upload failed: $(echo "$RESPONSE" | jq -r '.error.message // "unknown"')" | tee error.txt
+            exit 1
+          fi
+          echo "VIDEO_URL=$URL" >> "$GITHUB_ENV"
+          echo "Uploaded: $URL"
+
+      - name: Tell n8n the video is ready
+        run: |
+          jq -n --arg url "$VIDEO_URL" --arg job "$JOB_ID" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{ok: true, video_url: $url, job_id: $job, run_url: $run}' > result.json
+          curl -fsS --retry 3 -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' --data @result.json
+
+      - name: Tell n8n it failed
+        if: failure() || cancelled()
+        run: |
+          ERROR="$(cat error.txt 2>/dev/null || echo 'Render job failed')"
+          jq -n --arg err "$ERROR" --arg job "$JOB_ID" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            '{ok: false, error: ($err + " (log: " + $run + ")"), job_id: $job}' > result.json
+          curl -sS --retry 3 -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' --data @result.json || true
