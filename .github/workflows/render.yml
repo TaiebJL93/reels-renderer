@@ -109,7 +109,8 @@ jobs:
               cp "$VIDEO" reel.mp4
               # subtitle timings, used to show the moment cards exactly when their words are spoken
               SRT="$(find "mpt/storage/tasks/$TASK_ID" -name '*.srt' 2>/dev/null | head -1)"
-              [ -n "$SRT" ] && cp "$SRT" subs.srt
+              # the container writes it as root, so copy with sudo; without it the cards fall back to the script position
+              if [ -n "$SRT" ]; then sudo cp "$SRT" subs.srt && sudo chmod a+r subs.srt || echo "Subtitle timings not readable, cards use script position"; fi
               ls -lh reel.mp4
               exit 0
             fi
