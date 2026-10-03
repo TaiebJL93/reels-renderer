@@ -86,9 +86,11 @@ jobs:
         run: |
           printf '%s' "$REQUEST" > request.raw.json
           jq -e . request.raw.json >/dev/null || { echo "Request is not valid JSON" | tee error.txt; exit 1; }
-          # overlay_hook is for the headline step below, MoneyPrinterTurbo never sees it
+          # overlay_hook and overlay_cards are for the headline step below, MoneyPrinterTurbo never sees them
           jq -r '.overlay_hook // ""' request.raw.json > hook.txt
-          jq 'del(.overlay_hook)' request.raw.json > request.json
+          jq '.overlay_cards // []' request.raw.json > cards.json
+          jq -r '.video_script // ""' request.raw.json > script.txt
+          jq 'del(.overlay_hook, .overlay_cards)' request.raw.json > request.json
           RESPONSE="$(curl -sS -X POST http://127.0.0.1:8080/api/v1/videos -H 'Content-Type: application/json' --data @request.json)"
           TASK_ID="$(echo "$RESPONSE" | jq -r '.data.task_id // empty')"
           if [ -z "$TASK_ID" ]; then
@@ -105,6 +107,9 @@ jobs:
               VIDEO="$(find "mpt/storage/tasks/$TASK_ID" -name 'final-*.mp4' 2>/dev/null | head -1)"
               [ -n "$VIDEO" ] || { echo "Finished, but no MP4 was written" | tee error.txt; exit 1; }
               cp "$VIDEO" reel.mp4
+              # subtitle timings, used to show the moment cards exactly when their words are spoken
+              SRT="$(find "mpt/storage/tasks/$TASK_ID" -name '*.srt' 2>/dev/null | head -1)"
+              [ -n "$SRT" ] && cp "$SRT" subs.srt
               ls -lh reel.mp4
               exit 0
             fi
@@ -118,7 +123,7 @@ jobs:
           echo "Video not finished after 25 minutes" | tee error.txt
           exit 1
 
-      - name: Add hook headline, 30 fps, check size
+      - name: Add hook headline, moment cards, 30 fps, check size
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg fonts-dejavu-core >/dev/null
@@ -135,10 +140,81 @@ jobs:
               i=$((i+1))
             done < lines.txt
           fi
+          # Moment cards: big yellow score/number + small label, shown while their words are spoken
+          python3 - <<'PY'
+          # Builds ffmpeg drawbox/drawtext filters for the "moment cards" (big score/number + small label),
+          # timed to the spoken words via MoneyPrinterTurbo's subtitle file. Writes cards.filter (may be empty).
+          import json, os, re, subprocess
+
+          FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          norm = lambda s: re.sub(r"[^\w']+", " ", s.lower()).split()
+
+          def ts(x):
+              h, m, s = x.replace(",", ".").split(":")
+              return int(h) * 3600 + int(m) * 60 + float(s)
+
+          try:
+              cards = json.load(open("cards.json"))
+          except Exception:
+              cards = []
+          cards = [c for c in cards if isinstance(c, dict) and str(c.get("big", "")).strip()][:5]
+          dur = float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", "reel.mp4"],
+                                     capture_output=True, text=True).stdout.strip() or 0)
+
+          # word timeline from the .srt: every word gets a time, spread evenly inside its subtitle entry
+          words = []
+          if os.path.exists("subs.srt"):
+              for block in re.split(r"\n\s*\n", open("subs.srt", encoding="utf-8", errors="ignore").read()):
+                  m = re.search(r"(\d+:\d+:\d+[,.]\d+)\s*-->\s*(\d+:\d+:\d+[,.]\d+)\s*\n(.*)", block, re.S)
+                  if not m:
+                      continue
+                  a, b, ws = ts(m.group(1)), ts(m.group(2)), norm(m.group(3))
+                  for i, w in enumerate(ws):
+                      words.append((w, a + (b - a) * i / max(1, len(ws))))
+          script = norm(open("script.txt", encoding="utf-8").read()) if os.path.exists("script.txt") else []
+
+          def when(anchor):
+              key = norm(anchor)[:4]
+              if not key:
+                  return None
+              seq = [w for w, _ in words]
+              for i in range(len(seq) - len(key) + 1):
+                  if seq[i:i + len(key)] == key:
+                      return words[i][1]
+              for i in range(len(script) - len(key) + 1):  # fallback: position in the script, scaled to the video length
+                  if script[i:i + len(key)] == key:
+                      return dur * i / max(1, len(script))
+              return None
+
+          timed = sorted((t, c) for c in cards if (t := when(str(c.get("at", "")))) is not None)
+          parts = []
+          for n, (t, c) in enumerate(timed):
+              start = max(t, 3.2)  # never on top of the hook headline (first 3 s)
+              nxt = timed[n + 1][0] if n + 1 < len(timed) else dur
+              end = min(start + 2.4, max(start + 1.2, nxt - 0.1), dur - 0.2)
+              if end - start < 0.8:
+                  continue
+              big = str(c["big"]).strip().upper()[:10]
+              open(f"card{n}b.txt", "w").write(big)
+              size = min(170, int(960 / (len(big) * 0.8)))  # shrink long words so they fit the 1080 px width
+              small = str(c.get("small", "")).strip().upper()[:26]
+              on = f"between(t,{start:.2f},{end:.2f})"
+              fade = f"min(1,(t-{start:.2f})/0.2)"
+              parts.append(f"drawbox=x=0:y=640:w=iw:h=300:color=black@0.6:t=fill:enable='{on}'")
+              parts.append(f"drawtext=fontfile={FONT}:textfile=card{n}b.txt:expansion=none:fontsize={size}:fontcolor=0xFFD400:"
+                           f"borderw=6:bordercolor=black:x=(w-text_w)/2:y={665 + (170 - size) // 2}:alpha='{fade}':enable='{on}'")
+              if small:
+                  open(f"card{n}s.txt", "w").write(small)
+                  parts.append(f"drawtext=fontfile={FONT}:textfile=card{n}s.txt:expansion=none:fontsize=56:fontcolor=white:"
+                               f"x=(w-text_w)/2:y=860:alpha='{fade}':enable='{on}'")
+              print(f"card {n}: {c['big']!r} at {start:.1f}-{end:.1f}s")
+          open("cards.filter", "w").write(",".join(parts))
+          PY
+          if [ -s cards.filter ]; then FILTER="$FILTER,$(cat cards.filter)"; fi
           ffmpeg -hide_banner -loglevel error -y -i reel.mp4 -vf "$FILTER" \
             -c:v libx264 -preset medium -crf 20 -pix_fmt yuv420p -r 30 \
             -c:a aac -b:a 192k -ar 44100 -movflags +faststart reel-final.mp4 \
-            || { echo "Could not add the hook headline (ffmpeg failed)" | tee error.txt; exit 1; }
+            || { echo "Could not add the hook headline or moment cards (ffmpeg failed)" | tee error.txt; exit 1; }
           SIZE="$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height,r_frame_rate -of csv=p=0 reel-final.mp4)"
           echo "Final video: $SIZE"
           case "$SIZE" in
