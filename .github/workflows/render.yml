@@ -68,8 +68,144 @@ jobs:
         env:
           PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
           PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
         run: |
           mkdir -p mpt/storage
+          # ElevenLabs voice: used when n8n sends elevenlabs_voice_id and the ELEVENLABS_API_KEY secret exists,
+          # otherwise the reel keeps the Edge voice from the request (voice_name), exactly as before
+          EL_ID="$(printf '%s' "$REQUEST" | jq -r '.elevenlabs_voice_id // ""' 2>/dev/null || true)"
+          EL_MODEL="$(printf '%s' "$REQUEST" | jq -r '.elevenlabs_model // ""' 2>/dev/null || true)"
+          EL_FALLBACK_VOICE="$(printf '%s' "$REQUEST" | jq -r '.voice_name // ""' 2>/dev/null || true)"
+          [[ "$EL_MODEL" =~ ^[a-z0-9_]*$ ]] || EL_MODEL=""
+          export EL_MODEL EL_FALLBACK_VOICE
+          if [ -n "$EL_ID" ] && ! [[ "$EL_ID" =~ ^[A-Za-z0-9]{8,40}$ ]]; then echo "::warning::Invalid elevenlabs_voice_id, using the Edge voice"; EL_ID=""; fi
+          if [ -n "$EL_ID" ] && [ -z "$ELEVENLABS_API_KEY" ]; then echo "::warning::ELEVENLABS_API_KEY secret missing, using the Edge voice"; EL_ID=""; fi
+          echo "EL_ID=$EL_ID" >> "$GITHUB_ENV"
+          # el_voice.py: makes the voice with ElevenLabs (real word timings for subtitles and cards), falls back to Edge on any error
+          cat > mpt/el_voice.py <<'PYEOF'
+          # Starts MoneyPrinterTurbo with the ElevenLabs voice-over.
+          # The voice comes from ElevenLabs' "with-timestamps" endpoint, so the word-by-word subtitles and the
+          # moment cards get the real time of every word. If ElevenLabs fails (no credits, bad key, wrong voice id,
+          # network), the reel is voiced with the Edge voice instead, so a reel is never lost because of the voice.
+          # Writes storage/voice_used.json so render.yml can tell n8n which voice was used.
+          import base64, json, os, re, runpy, sys
+
+          ROOT = os.path.dirname(os.path.abspath(__file__))
+          os.chdir(ROOT)
+          sys.path.insert(0, ROOT)
+
+          import requests
+          from edge_tts import SubMaker
+          from loguru import logger
+          from app.services import voice
+
+          API_KEY = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+          MODEL = os.environ.get("EL_MODEL", "").strip() or "eleven_multilingual_v2"
+          FALLBACK = os.environ.get("EL_FALLBACK_VOICE", "").strip() or "en-US-AndrewMultilingualNeural-Male"
+          STATUS_FILE = os.path.join(ROOT, "storage", "voice_used.json")
+          _edge_tts = voice.tts
+
+
+          def _status(**info):
+              try:
+                  with open(STATUS_FILE, "w") as f:
+                      json.dump(info, f)
+              except Exception as e:
+                  logger.warning(f"could not write {STATUS_FILE}: {e}")
+
+
+          def _words(alignment):
+              """Character timings -> [(word, start_s, end_s)], punctuation trimmed like Edge word boundaries."""
+              chars = alignment["characters"]
+              starts = alignment["character_start_times_seconds"]
+              ends = alignment["character_end_times_seconds"]
+              words, cur, t0, t1 = [], "", None, None
+              for ch, a, b in zip(chars, starts, ends):
+                  if ch.isspace():
+                      if cur:
+                          words.append((cur, t0, t1))
+                      cur, t0 = "", None
+                      continue
+                  if t0 is None:
+                      t0 = a
+                  cur, t1 = cur + ch, b
+              if cur:
+                  words.append((cur, t0, t1))
+              out = []
+              for w, a, b in words:
+                  w = re.sub(r"^[^\w']+|[^\w']+$", "", w)
+                  if w:
+                      out.append((w, a, b))
+              return out
+
+
+          def _elevenlabs(text, voice_id, voice_file):
+              if not API_KEY:
+                  raise RuntimeError("ELEVENLABS_API_KEY secret is not set")
+              # one request only: a retry after a timeout could be charged twice
+              r = requests.post(
+                  f"https://api.elevenlabs.io/v1/text-to-speech/{voice_id}/with-timestamps",
+                  params={"output_format": "mp3_44100_128"},
+                  headers={"xi-api-key": API_KEY, "Content-Type": "application/json"},
+                  json={
+                      "text": text,
+                      "model_id": MODEL,
+                      "voice_settings": {"stability": 0.45, "similarity_boost": 0.8, "style": 0.15, "use_speaker_boost": True},
+                  },
+                  timeout=(15, 180),
+                  allow_redirects=False,
+              )
+              if r.status_code != 200:
+                  detail = r.text[:200]
+                  try:
+                      d = r.json().get("detail")
+                      detail = (d.get("status", "") + " " + d.get("message", "")).strip() if isinstance(d, dict) else str(d)[:200]
+                  except Exception:
+                      pass
+                  raise RuntimeError(f"ElevenLabs HTTP {r.status_code}: {detail}")
+              data = r.json()
+              audio = base64.b64decode(data.get("audio_base64") or "")
+              alignment = data.get("alignment") or data.get("normalized_alignment")
+              if len(audio) < 1000 or not alignment:
+                  raise RuntimeError("ElevenLabs returned no audio or no word timings")
+              words = _words(alignment)
+              if not words:
+                  raise RuntimeError("ElevenLabs word timings are empty")
+              os.makedirs(os.path.dirname(os.path.abspath(voice_file)), exist_ok=True)
+              with open(voice_file, "wb") as f:
+                  f.write(audio)
+              sub_maker = SubMaker()
+              if getattr(sub_maker, "cues", None) is None:
+                  sub_maker.cues = []
+              # MoneyPrinterTurbo's word-by-word subtitles read these (times in 100 ns units)
+              sub_maker.subs = [w for w, _, _ in words]
+              sub_maker.offset = [(int(a * 10_000_000), int(max(b, a + 0.05) * 10_000_000)) for _, a, b in words]
+              return sub_maker, len(words), round(words[-1][2], 1)
+
+
+          def tts(text, voice_name, voice_rate, voice_file, voice_volume=1.0, *args, **kwargs):
+              if not str(voice_name or "").startswith("elevenlabs:"):
+                  _status(provider="edge", voice=voice_name)
+                  return _edge_tts(text, voice_name, voice_rate, voice_file, voice_volume, *args, **kwargs)
+              voice_id = voice_name.split(":")[1]
+              clean = voice.utils.remove_pause_tags(text) if hasattr(voice.utils, "remove_pause_tags") else text
+              try:
+                  sub_maker, n, secs = _elevenlabs(clean, voice_id, voice_file)
+                  logger.success(f"ElevenLabs voice {voice_id} ({MODEL}): {n} words, {secs} s, {len(clean)} characters")
+                  _status(provider="elevenlabs", voice=voice_id, model=MODEL, characters=len(clean))
+                  return sub_maker
+              except Exception as e:
+                  reason = str(e)[:240]
+                  logger.warning(f"ElevenLabs failed, using the Edge voice {FALLBACK} instead: {reason}")
+                  _status(provider="edge", voice=FALLBACK, fallback_reason=reason)
+                  return _edge_tts(text, FALLBACK, voice_rate, voice_file, voice_volume, *args, **kwargs)
+
+
+          voice.tts = tts
+
+          if __name__ == "__main__":
+              runpy.run_path(os.path.join(ROOT, "main.py"), run_name="__main__")
+          PYEOF
           docker pull -q "$IMAGE"
           docker run --rm --entrypoint cat "$IMAGE" /MoneyPrinterTurbo/config.example.toml > mpt/config.toml
           sed -i -E \
@@ -78,10 +214,14 @@ jobs:
             -e "s|^max_concurrent_tasks = .*|max_concurrent_tasks = 1|" \
             -e "s|^subtitle_provider = .*|subtitle_provider = \"edge\"|" \
             mpt/config.toml
+          ENTRY=main.py
+          if [ -n "$EL_ID" ]; then ENTRY=el_voice.py; echo "Voice: ElevenLabs $EL_ID (fallback $EL_FALLBACK_VOICE)"; fi
           docker run -d --name mpt -p 127.0.0.1:8080:8080 \
+            -e ELEVENLABS_API_KEY -e EL_MODEL -e EL_FALLBACK_VOICE \
             -v "$PWD/mpt/config.toml:/MoneyPrinterTurbo/config.toml" \
             -v "$PWD/mpt/storage:/MoneyPrinterTurbo/storage" \
-            "$IMAGE" python3 main.py
+            -v "$PWD/mpt/el_voice.py:/MoneyPrinterTurbo/el_voice.py:ro" \
+            "$IMAGE" python3 "$ENTRY"
           for _ in $(seq 1 90); do
             curl -fs http://127.0.0.1:8080/api/v1/tasks >/dev/null && exit 0
             sleep 2
@@ -98,7 +238,8 @@ jobs:
           jq -r '.overlay_hook // ""' request.raw.json > hook.txt
           jq '.overlay_cards // []' request.raw.json > cards.json
           jq -r '.video_script // ""' request.raw.json > script.txt
-          jq 'del(.overlay_hook, .overlay_cards)' request.raw.json > request.json
+          jq --arg el "$EL_ID" 'del(.overlay_hook, .overlay_cards, .elevenlabs_voice_id, .elevenlabs_model)
+            | if $el != "" then .voice_name = ("elevenlabs:" + $el + ":VortexMindset") else . end' request.raw.json > request.json
           RESPONSE="$(curl -sS -X POST http://127.0.0.1:8080/api/v1/videos -H 'Content-Type: application/json' --data @request.json)"
           TASK_ID="$(echo "$RESPONSE" | jq -r '.data.task_id // empty')"
           if [ -z "$TASK_ID" ]; then
@@ -115,6 +256,8 @@ jobs:
               VIDEO="$(find "mpt/storage/tasks/$TASK_ID" -name 'final-*.mp4' 2>/dev/null | head -1)"
               [ -n "$VIDEO" ] || { echo "Finished, but no MP4 was written" | tee error.txt; exit 1; }
               cp "$VIDEO" reel.mp4
+              # which voice was really used (ElevenLabs, or Edge with the reason), reported to n8n
+              if [ -f mpt/storage/voice_used.json ]; then echo "VOICE_INFO=$(sudo cat mpt/storage/voice_used.json | jq -c .)" >> "$GITHUB_ENV"; fi
               # subtitle timings, used to show the moment cards exactly when their words are spoken
               SRT="$(find "mpt/storage/tasks/$TASK_ID" -name '*.srt' 2>/dev/null | head -1)"
               # the container writes it as root, so copy with sudo; without it the cards fall back to the script position
@@ -273,7 +416,8 @@ jobs:
       - name: Tell n8n the video is ready
         run: |
           jq -n --arg url "$VIDEO_URL" --arg job "$JOB_ID" --arg run "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            '{ok: true, video_url: $url, job_id: $job, run_url: $run}' > result.json
+            --argjson voice "${VOICE_INFO:-null}" \
+            '{ok: true, video_url: $url, job_id: $job, run_url: $run, voice: $voice}' > result.json
           curl -fsS --retry 3 -X POST "$CALLBACK_URL" -H 'Content-Type: application/json' --data @result.json
 
       - name: Tell n8n it failed
